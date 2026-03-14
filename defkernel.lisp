@@ -1,4 +1,4 @@
-;;;; cl-gpu.lisp — Lisp AST → Deterministic GPU Kernel Compiler
+;;;; defkernel.lisp — Lisp AST → Deterministic GPU Kernel Compiler
 ;;;;
 ;;;; The idea: Common Lisp macros operate on the AST before compilation.
 ;;;; We use this to REWRITE arithmetic expressions into a form with
@@ -18,14 +18,14 @@
 ;;;; The Lisp code never runs on the GPU. It's a COMPILER that
 ;;;; generates deterministic OpenCL C at compile time.
 ;;;;
-;;;; Usage: sbcl --load cl-gpu.lisp
+;;;; Usage: sbcl --load defkernel.lisp
 
-(defpackage #:cl-gpu
+(defpackage #:defkernel
   (:use #:cl)
   (:export #:defkernel #:compile-kernel #:kernel-source
            #:kvec #:kscalar #:kreduce #:kmap))
 
-(in-package #:cl-gpu)
+(in-package #:defkernel)
 
 ;;; ═══════════════════════════════════════════════════════════════════
 ;;; 1. SSA IR — Static Single Assignment intermediate representation
@@ -187,12 +187,7 @@
 ;;;
 ;;; Each SSA node becomes one line of C.
 ;;; Field arithmetic uses explicit mod operations.
-;;; The Goldilocks prime is hardcoded as a u128 constant.
 ;;; ═══════════════════════════════════════════════════════════════════
-
-(defparameter *goldilocks-prime-str*
-  "((ulong)(0xFFFFFFFF00000001UL))"
-  "Goldilocks prime P = 2^64 - 2^32 + 1 as C literal.")
 
 (defparameter *field-preamble*
   "
@@ -436,9 +431,7 @@ inline ulong fp_mul(ulong a, ulong b) {
 (defun run-tests ()
   (setf *test-pass* 0 *test-fail* 0)
 
-  (format t "~%╔══════════════════════════════════════════╗~%")
-  (format t   "║  CL-GPU: Deterministic Kernel Compiler   ║~%")
-  (format t   "╚══════════════════════════════════════════╝~%")
+  (format t "~%══ defkernel: Deterministic Kernel Compiler ══~%")
 
   ;; ── Test 1: Simple field multiply ──────────────────
   (format t "~%=== Scalar Kernels ===~%")

@@ -6,10 +6,10 @@
 ;;;;
 ;;;; Usage: sbcl --load test-determinism.lisp
 
-(load (merge-pathnames "cl-gpu.lisp" *load-truename*))
+(load (merge-pathnames "defkernel.lisp" *load-truename*))
 (load (merge-pathnames "runtime.lisp" *load-truename*))
 
-(in-package #:cl-gpu)
+(in-package #:defkernel)
 
 ;;; Kernels
 
@@ -86,9 +86,7 @@
 (defun run-tests ()
   (setf *pass* 0 *fail* 0 *details* nil)
 
-  (format t "~%╔══════════════════════════════════════════════════════╗~%")
-  (format t   "║  CL-GPU: Determinism Edge-Case Tests (GPU)          ║~%")
-  (format t   "╚══════════════════════════════════════════════════════╝~%")
+  (format t "~%══ defkernel: Determinism Edge-Case Tests (GPU) ══~%")
 
   (unless (gpu-available-p)
     (format t "~%No OpenCL device. Skipping.~%")

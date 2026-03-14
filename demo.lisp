@@ -1,13 +1,13 @@
-;;;; demo.lisp — Run cl-gpu kernels on actual GPU hardware
+;;;; demo.lisp — Run defkernel kernels on actual GPU hardware
 ;;;;
 ;;;; Usage: sbcl --load demo.lisp
 
-(format t "~%Loading cl-gpu compiler...~%")
-(load (merge-pathnames "cl-gpu.lisp" *load-truename*))
+(format t "~%Loading defkernel compiler...~%")
+(load (merge-pathnames "defkernel.lisp" *load-truename*))
 (format t "Loading OpenCL runtime...~%")
 (load (merge-pathnames "runtime.lisp" *load-truename*))
 
-(in-package #:cl-gpu)
+(in-package #:defkernel)
 
 ;;; ═══════════════════════════════════════════════════════════════════
 ;;; Define kernels (compiled at load time, not at runtime)
@@ -44,9 +44,7 @@
 ;;; ═══════════════════════════════════════════════════════════════════
 
 (defun run-demo ()
-  (format t "~%╔══════════════════════════════════════════════╗~%")
-  (format t   "║  CL-GPU: Real GPU Execution Demo              ║~%")
-  (format t   "╚══════════════════════════════════════════════╝~%")
+  (format t "~%══ defkernel: GPU Execution Demo ══~%")
 
   ;; Show generated kernels
   (format t "~%=== Generated OpenCL C Sources ===~%")

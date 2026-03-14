@@ -1,27 +1,27 @@
-;;;; runtime.lisp — OpenCL runtime via CFFI for cl-gpu kernels
+;;;; runtime.lisp — OpenCL runtime via CFFI for defkernel kernels
 ;;;;
 ;;;; Provides: gpu-init, gpu-execute, gpu-cleanup, gpu-available-p
 ;;;;
 ;;;; Usage:
 ;;;;   (ql:quickload :cffi)            ; if needed
-;;;;   (load "cl-gpu.lisp")
+;;;;   (load "defkernel.lisp")
 ;;;;   (load "runtime.lisp")
-;;;;   (cl-gpu:gpu-init)
-;;;;   (cl-gpu:gpu-execute *my-kernel* :global-size 1024
+;;;;   (defkernel:gpu-init)
+;;;;   (defkernel:gpu-execute *my-kernel* :global-size 1024
 ;;;;     :inputs '((:a #(1 2 3 ...)) (:b #(4 5 6 ...)))
 ;;;;     :scalars '((:n . 1024))
 ;;;;     :output-size 1024)
-;;;;   (cl-gpu:gpu-cleanup)
+;;;;   (defkernel:gpu-cleanup)
 
-(in-package #:cl-gpu)
+(in-package #:defkernel)
 
 ;;; ═══════════════════════════════════════════════════════════════════
-;;; 0. Mark runtime as loaded (prevents auto-test on cl-gpu.lisp load)
+;;; 0. Mark runtime as loaded (prevents auto-test on defkernel.lisp load)
 ;;; ═══════════════════════════════════════════════════════════════════
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (unless (find-package :cl-gpu/runtime)
-    (defpackage #:cl-gpu/runtime)))
+  (unless (find-package :defkernel/runtime)
+    (defpackage #:defkernel/runtime)))
 
 ;;; ═══════════════════════════════════════════════════════════════════
 ;;; 1. Load CFFI and define OpenCL foreign library
@@ -590,7 +590,7 @@
 
     ;; Parse keyword args
     (loop for (key val) on args by #'cddr
-          for pname = (intern (symbol-name key) :cl-gpu)
+          for pname = (intern (symbol-name key) :defkernel)
           for param = (find pname params :key #'first)
           do (unless param
                (error "Unknown parameter ~A for kernel ~A" key (kernel-name kernel)))
@@ -617,4 +617,4 @@
   (export '(gpu-init gpu-cleanup gpu-info gpu-execute gpu-map
             gpu-available-p gpu-state gpu-state-device-name
             *gpu*)
-          :cl-gpu))
+          :defkernel))
