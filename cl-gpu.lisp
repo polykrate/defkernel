@@ -71,6 +71,8 @@
 ;;; the tree depth-first left-to-right, the SSA order is fixed.
 ;;; ═══════════════════════════════════════════════════════════════════
 
+(declaim (ftype function lower-binop lower-reduce param-to-c))
+
 (defun lower-expr (expr)
   "Lower a Lisp expression to SSA. Returns the SSA name of the result."
   (cond
@@ -189,8 +191,49 @@
 ;;; ═══════════════════════════════════════════════════════════════════
 
 (defparameter *goldilocks-prime-str*
-  "((ulong)(0xFFFFFFFF00000001ULL))"
+  "((ulong)(0xFFFFFFFF00000001UL))"
   "Goldilocks prime P = 2^64 - 2^32 + 1 as C literal.")
+
+(defparameter *field-preamble*
+  "
+#define GP 0xFFFFFFFF00000001UL
+#define EPSILON 0xFFFFFFFFUL
+
+inline ulong fp_add(ulong a, ulong b) {
+  ulong r = a + b;
+  ulong c = (r < a);
+  if (c) return r + EPSILON;
+  return (r >= GP) ? r - GP : r;
+}
+
+inline ulong fp_sub(ulong a, ulong b) {
+  if (a >= b) return a - b;
+  return GP - (b - a);
+}
+
+inline ulong fp_mul(ulong a, ulong b) {
+  ulong lo = a * b;
+  ulong hi = mul_hi(a, b);
+  ulong hi_l = hi & EPSILON;
+  ulong hi_h = hi >> 32;
+  ulong term = hi_l * EPSILON;
+  ulong r = lo + term;
+  ulong over = (r < lo) ? 1UL : 0UL;
+  ulong under = (hi_h > r) ? 1UL : 0UL;
+  r -= hi_h;
+  if (over > under) {
+    r += EPSILON;
+    if (r < EPSILON) r += EPSILON;
+  } else if (under > over) {
+    if (r >= EPSILON) r -= EPSILON;
+    else r += (GP - EPSILON);
+  }
+  if (r >= GP) r -= GP;
+  return r;
+}
+"
+  "OpenCL C helper functions for Goldilocks field arithmetic.
+   Uses mul_hi() instead of __int128 for GPU compatibility.")
 
 (defun ssa-name-to-c (name)
   "Convert SSA name :T0 to C variable name \"t0\"."
@@ -210,20 +253,20 @@
 
       (:load-scalar
        (format stream "  ~A ~A = ~A;~%" ct var
-               (string-downcase (symbol-name (first args)))))
+               (sanitize-c-name (first args))))
 
       (:load-vec
        (format stream "  ~A ~A = ~A[gid];~%" ct var
-               (string-downcase (symbol-name (first args)))))
+               (sanitize-c-name (first args))))
 
       (:load-element
        (let ((vec (first args))
              (idx (second args)))
          (if (integerp idx)
              (format stream "  ~A ~A = ~A[~D];~%" ct var
-                     (string-downcase (symbol-name vec)) idx)
+                     (sanitize-c-name vec) idx)
              (format stream "  ~A ~A = ~A[~A];~%" ct var
-                     (string-downcase (symbol-name vec))
+                     (sanitize-c-name vec)
                      (ssa-name-to-c idx)))))
 
       ;; Wrapping u64 arithmetic
@@ -251,26 +294,22 @@
                       (ssa-name-to-c (first args))
                       (ssa-name-to-c (second args))))
 
-      ;; Field arithmetic: use u128 intermediate to avoid overflow
+      ;; Field arithmetic: call helper functions (no __int128 needed)
       (:field-add
-       (format stream "  ~A ~A = ((ulong)(((unsigned __int128)~A + ~A) % ~A));~%"
+       (format stream "  ~A ~A = fp_add(~A, ~A);~%"
                ct var
                (ssa-name-to-c (first args))
-               (ssa-name-to-c (second args))
-               *goldilocks-prime-str*))
+               (ssa-name-to-c (second args))))
       (:field-sub
-       (format stream "  ~A ~A = ((ulong)(((unsigned __int128)~A - ~A + ~A) % ~A));~%"
+       (format stream "  ~A ~A = fp_sub(~A, ~A);~%"
                ct var
                (ssa-name-to-c (first args))
-               (ssa-name-to-c (second args))
-               *goldilocks-prime-str*
-               *goldilocks-prime-str*))
+               (ssa-name-to-c (second args))))
       (:field-mul
-       (format stream "  ~A ~A = ((ulong)(((unsigned __int128)~A * ~A) % ~A));~%"
+       (format stream "  ~A ~A = fp_mul(~A, ~A);~%"
                ct var
                (ssa-name-to-c (first args))
-               (ssa-name-to-c (second args))
-               *goldilocks-prime-str*)))))
+               (ssa-name-to-c (second args)))))))
 
 ;;; ═══════════════════════════════════════════════════════════════════
 ;;; 5. Kernel compiler: AST → SSA → OpenCL C
@@ -281,6 +320,13 @@
   (params nil :type list)           ; ((name type) ...) where type = :scalar | :vec | :out
   (source "" :type string)          ; generated OpenCL C source
   (ssa nil :type list))             ; SSA nodes for inspection
+
+(defun sanitize-c-name (name)
+  "Turn a Lisp symbol name into a valid C identifier.
+   *foo-bar* → foo_bar, MY-KERNEL → my_kernel"
+  (let* ((s (string-downcase (symbol-name name)))
+         (s (remove #\* s)))
+    (substitute #\_ #\- s)))
 
 (defun compile-kernel (name params body)
   "Compile a kernel body to OpenCL C.
@@ -298,10 +344,17 @@
       (let ((nodes (nreverse *ssa-nodes*)))
 
         ;; Generate OpenCL C
-        (let ((source (with-output-to-string (s)
+        (let* ((has-field (some (lambda (n)
+                                  (member (ssa-node-op n)
+                                          '(:field-add :field-sub :field-mul)))
+                                nodes))
+               (source (with-output-to-string (s)
+                        ;; Preamble for field arithmetic helpers
+                        (when has-field
+                          (write-string *field-preamble* s))
                         ;; Kernel signature
                         (format s "__kernel void ~A(~{~A~^, ~}) {~%"
-                                (string-downcase (symbol-name name))
+                                (sanitize-c-name name)
                                 (mapcar #'param-to-c params))
                         (format s "  size_t gid = get_global_id(0);~%")
 
@@ -313,7 +366,7 @@
                         (let ((out-param (find :out params :key #'second)))
                           (when out-param
                             (format s "  ~A[gid] = ~A;~%"
-                                    (string-downcase (symbol-name (first out-param)))
+                                    (sanitize-c-name (first out-param))
                                     (ssa-name-to-c result-name))))
 
                         (format s "}~%"))))
@@ -325,7 +378,7 @@
 
 (defun param-to-c (param)
   "Convert a kernel parameter spec to C syntax."
-  (let ((name (string-downcase (symbol-name (first param))))
+  (let ((name (sanitize-c-name (first param)))
         (type (second param)))
     (ecase type
       (:scalar (format nil "ulong ~A" name))
@@ -396,8 +449,8 @@
     (check "field-square compiles" (kernel-p k))
     (check "source contains kernel"
            (search "__kernel void" (kernel-source k)))
-    (check "source has __int128 for field mul"
-           (search "__int128" (kernel-source k)))
+    (check "source uses fp_mul helper"
+           (search "fp_mul" (kernel-source k)))
     (check "source has mod P"
            (search "0xFFFFFFFF00000001" (kernel-source k)))
     (check "source writes to out[gid]"
@@ -521,10 +574,4 @@
   (format t "═══════════════════════════════════════════~%")
   (zerop *test-fail*))
 
-;;; ═══════════════════════════════════════════════════════════════════
-;;; Auto-run tests when loaded
-;;; ═══════════════════════════════════════════════════════════════════
-
-(let ((ok (run-tests)))
-  (finish-output)
-  (sb-ext:exit :code (if ok 0 1)))
+;;; To run tests: sbcl --load tests.lisp
