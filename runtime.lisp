@@ -610,11 +610,127 @@
                  :output-size global-size)))
 
 ;;; ═══════════════════════════════════════════════════════════════════
+;;; 12. Buffer management for multi-pass GPU dispatch
+;;;
+;;; NTT needs log2(N) kernel launches with data staying on GPU.
+;;; These functions avoid CPU round-trips between passes.
+;;; ═══════════════════════════════════════════════════════════════════
+
+(defstruct gpu-buffer
+  (handle (cffi:null-pointer) :type cffi:foreign-pointer)
+  (size 0 :type fixnum))
+
+(defun gpu-alloc (n &key (flags +cl-mem-read-write+))
+  "Allocate a GPU buffer for N u64 elements. Returns a GPU-BUFFER."
+  (unless *gpu* (error "GPU not initialized."))
+  (cffi:with-foreign-object (err :int32)
+    (let ((buf (%cl-create-buffer (gpu-state-context *gpu*)
+                                  flags (* n 8)
+                                  (cffi:null-pointer) err)))
+      (cl-check (cffi:mem-ref err :int32) "clCreateBuffer(alloc)")
+      (make-gpu-buffer :handle buf :size n))))
+
+(defun gpu-upload (gpu-buf data)
+  "Upload a Lisp u64 vector to a GPU buffer."
+  (unless *gpu* (error "GPU not initialized."))
+  (let ((n (min (gpu-buffer-size gpu-buf) (length data))))
+    (cffi:with-foreign-object (host :uint64 n)
+      (loop for i below n
+            do (setf (cffi:mem-aref host :uint64 i) (aref data i)))
+      (cl-check
+       (%cl-enqueue-write-buffer (gpu-state-queue *gpu*)
+                                 (gpu-buffer-handle gpu-buf)
+                                 1 0 (* n 8) host
+                                 0 (cffi:null-pointer) (cffi:null-pointer))
+       "clEnqueueWriteBuffer(upload)"))))
+
+(defun gpu-download (gpu-buf &optional n)
+  "Download GPU buffer to a Lisp u64 vector."
+  (unless *gpu* (error "GPU not initialized."))
+  (let ((n (or n (gpu-buffer-size gpu-buf))))
+    (let ((result (make-array n :element-type '(unsigned-byte 64))))
+      (cffi:with-foreign-object (host :uint64 n)
+        (cl-check
+         (%cl-enqueue-read-buffer (gpu-state-queue *gpu*)
+                                  (gpu-buffer-handle gpu-buf)
+                                  1 0 (* n 8) host
+                                  0 (cffi:null-pointer) (cffi:null-pointer))
+         "clEnqueueReadBuffer(download)")
+        (loop for i below n
+              do (setf (aref result i) (cffi:mem-aref host :uint64 i))))
+      result)))
+
+(defun gpu-free (gpu-buf)
+  "Release a GPU buffer."
+  (when gpu-buf
+    (%cl-release-mem-object (gpu-buffer-handle gpu-buf))))
+
+(defun gpu-dispatch (kernel &key (global-size 1) buffers scalars)
+  "Execute kernel on pre-allocated GPU buffers without downloading results.
+
+   KERNEL: a KERNEL struct.
+   GLOBAL-SIZE: number of work items.
+   BUFFERS: alist of (param-name . gpu-buffer) for :vec and :out params.
+   SCALARS: alist of (param-name . u64-value) for :scalar params."
+  (unless *gpu* (error "GPU not initialized."))
+  (let* ((source (kernel-source kernel))
+         (program (compile-opencl-source source))
+         (k-name (sanitize-c-name (kernel-name kernel)))
+         (params (kernel-params kernel)))
+
+    (cffi:with-foreign-object (err :int32)
+      (let ((cl-kernel (%cl-create-kernel program k-name err)))
+        (cl-check (cffi:mem-ref err :int32) "clCreateKernel(dispatch)")
+
+        (unwind-protect
+             (progn
+               (loop for (pname ptype) in params
+                     for arg-index from 0
+                     do (ecase ptype
+                          ((:vec :out)
+                           (let ((gb (cdr (assoc pname buffers))))
+                             (unless gb
+                               (error "Missing buffer for param ~A" pname))
+                             (cffi:with-foreign-object (buf-ptr :pointer)
+                               (setf (cffi:mem-ref buf-ptr :pointer)
+                                     (gpu-buffer-handle gb))
+                               (cl-check
+                                (%cl-set-kernel-arg cl-kernel arg-index
+                                                    (cffi:foreign-type-size :pointer)
+                                                    buf-ptr)
+                                "clSetKernelArg(buffer)"))))
+                          (:scalar
+                           (let ((val (cdr (assoc pname scalars))))
+                             (unless val
+                               (error "Missing scalar for param ~A" pname))
+                             (cffi:with-foreign-object (val-ptr :uint64)
+                               (setf (cffi:mem-ref val-ptr :uint64) val)
+                               (cl-check
+                                (%cl-set-kernel-arg cl-kernel arg-index 8 val-ptr)
+                                "clSetKernelArg(scalar)"))))))
+
+               (cffi:with-foreign-object (gws :size)
+                 (setf (cffi:mem-ref gws :size) global-size)
+                 (cl-check
+                  (%cl-enqueue-nd-range-kernel
+                   (gpu-state-queue *gpu*)
+                   cl-kernel 1
+                   (cffi:null-pointer) gws (cffi:null-pointer)
+                   0 (cffi:null-pointer) (cffi:null-pointer))
+                  "clEnqueueNDRangeKernel(dispatch)"))
+
+               (cl-check (%cl-finish (gpu-state-queue *gpu*)) "clFinish(dispatch)"))
+
+          (%cl-release-kernel cl-kernel))))))
+
+;;; ═══════════════════════════════════════════════════════════════════
 ;;; Export runtime symbols
 ;;; ═══════════════════════════════════════════════════════════════════
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (export '(gpu-init gpu-cleanup gpu-info gpu-execute gpu-map
             gpu-available-p gpu-state gpu-state-device-name
+            gpu-alloc gpu-upload gpu-download gpu-dispatch gpu-free
+            gpu-buffer gpu-buffer-handle gpu-buffer-size
             *gpu*)
           :defkernel))

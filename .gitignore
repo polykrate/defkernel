@@ -1,0 +1,6 @@
+*.fasl
+*.lx64fsl
+*.dx64fsl
+*~
+\#*\#
+.cache/

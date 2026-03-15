@@ -13,6 +13,7 @@
 ;;;;   1. Use integer field arithmetic (mod P) — exact, no floats
 ;;;;   2. Impose a fixed evaluation order via SSA form
 ;;;;   3. Generate balanced binary reduction trees (not left-folds)
+
 ;;;;   4. All of this happens at MACROEXPANSION TIME via Lisp macros
 ;;;;
 ;;;; The Lisp code never runs on the GPU. It's a COMPILER that
@@ -80,6 +81,10 @@
     ((integerp expr)
      (emit-ssa :const (list expr)))
 
+    ;; gid = work-item index (get_global_id(0))
+    ((and (symbolp expr) (eq expr 'gid))
+     (emit-ssa :load-gid nil))
+
     ;; Symbol = variable reference (scalar or vector element)
     ((symbolp expr)
      (let ((info (assoc expr *ssa-inputs*)))
@@ -126,6 +131,26 @@
           (let ((vec (first operands))
                 (len (second operands)))
             (lower-reduce :field-add vec len)))
+
+         ;; Integer division and modulo (for index computation)
+         (idiv (let ((a (lower-expr (first operands)))
+                     (b (lower-expr (second operands))))
+                 (emit-ssa :idiv (list a b))))
+         (imod (let ((a (lower-expr (first operands)))
+                     (b (lower-expr (second operands))))
+                 (emit-ssa :imod (list a b))))
+
+         ;; Comparison: returns 0 or 1 as u64
+         (cmp< (let ((a (lower-expr (first operands)))
+                     (b (lower-expr (second operands))))
+                 (emit-ssa :cmp-lt (list a b))))
+
+         ;; Conditional: (select cond then else) → cond ? then : else
+         (select
+          (let ((c (lower-expr (first operands)))
+                (a (lower-expr (second operands)))
+                (b (lower-expr (third operands))))
+            (emit-ssa :select (list c a b))))
 
          ;; Element-wise map: (map-kernel (x vec) body)
          ;; This doesn't lower inline — it marks a parallel region
@@ -288,6 +313,29 @@ inline ulong fp_mul(ulong a, ulong b) {
       (:shift (format stream "  ~A ~A = ~A << ~A;~%" ct var
                       (ssa-name-to-c (first args))
                       (ssa-name-to-c (second args))))
+
+      ;; Work-item index
+      (:load-gid
+       (format stream "  ~A ~A = (ulong)get_global_id(0);~%" ct var))
+
+      ;; Integer division and modulo
+      (:idiv (format stream "  ~A ~A = ~A / ~A;~%" ct var
+                     (ssa-name-to-c (first args))
+                     (ssa-name-to-c (second args))))
+      (:imod (format stream "  ~A ~A = ~A % ~A;~%" ct var
+                     (ssa-name-to-c (first args))
+                     (ssa-name-to-c (second args))))
+
+      ;; Comparison and conditional
+      (:cmp-lt
+       (format stream "  ~A ~A = (ulong)(~A < ~A);~%" ct var
+               (ssa-name-to-c (first args))
+               (ssa-name-to-c (second args))))
+      (:select
+       (format stream "  ~A ~A = ~A ? ~A : ~A;~%" ct var
+               (ssa-name-to-c (first args))
+               (ssa-name-to-c (second args))
+               (ssa-name-to-c (third args))))
 
       ;; Field arithmetic: call helper functions (no __int128 needed)
       (:field-add
@@ -556,6 +604,48 @@ inline ulong fp_mul(ulong a, ulong b) {
       (check "poly-eval: 3 muls + 2 adds"
              (and (= (count :field-mul ops) 3)
                   (= (count :field-add ops) 2))))
+    (format t "~%  Generated:~%~A~%" (kernel-source k)))
+
+  ;; ── Test 8: New operations (gid, idiv, imod, cmp<, select) ───
+  (format t "~%=== Index & Control Flow ===~%")
+
+  ;; gid access
+  (let ((k (compile-kernel 'identity
+                           '((data :vec) (out :out))
+                           '(aref data gid))))
+    (check "gid compiles" (kernel-p k))
+    (check "gid: source has get_global_id"
+           (search "get_global_id" (kernel-source k)))
+    (let ((ops (mapcar #'ssa-node-op (kernel-ssa k))))
+      (check "gid: has :load-gid op" (member :load-gid ops))))
+
+  ;; idiv and imod
+  (let ((k (compile-kernel 'div-mod-test
+                           '((data :vec) (out :out) (stride :scalar))
+                           '(+ (idiv gid stride) (imod gid stride)))))
+    (check "idiv/imod compiles" (kernel-p k))
+    (let ((src (kernel-source k)))
+      (check "idiv: source has /" (search " / " src))
+      (check "imod: source has %" (search " % " src))))
+
+  ;; cmp< and select (butterfly-like pattern)
+  (let ((k (compile-kernel 'butterfly-test
+                           '((data :vec) (twiddles :vec) (out :out) (stride :scalar))
+                           '(select (cmp< (imod gid (* 2 stride)) stride)
+                                    (f+ (aref data gid)
+                                        (f* (aref twiddles gid) (aref data (+ gid stride))))
+                                    (f- (aref data gid)
+                                        (f* (aref twiddles gid) (aref data (- gid stride))))))))
+    (check "butterfly compiles" (kernel-p k))
+    (let* ((ops (mapcar #'ssa-node-op (kernel-ssa k)))
+           (src (kernel-source k)))
+      (check "butterfly: has cmp-lt" (member :cmp-lt ops))
+      (check "butterfly: has select" (member :select ops))
+      (check "butterfly: has ternary in C" (search " ? " src))
+      (check "butterfly: has field-add+sub+mul"
+             (and (member :field-add ops)
+                  (member :field-sub ops)
+                  (member :field-mul ops))))
     (format t "~%  Generated:~%~A~%" (kernel-source k)))
 
   ;; ── Results ──────────────────────────────────────────
